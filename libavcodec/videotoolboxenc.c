@@ -2018,8 +2018,8 @@ static void free_avframe(
     AVFrame *frame = release_ctx;
     av_frame_free(&frame);
 }
-#else
-//Not used on OSX - frame is never copied.
+#endif //!TARGET_OS_IPHONE
+
 static int copy_avframe_to_pixel_buffer(AVCodecContext   *avctx,
                                         const AVFrame    *frame,
                                         CVPixelBufferRef cv_img,
@@ -2111,7 +2111,61 @@ static int copy_avframe_to_pixel_buffer(AVCodecContext   *avctx,
 
     return 0;
 }
-#endif //!TARGET_OS_IPHONE
+
+static int create_cv_pixel_buffer_with_copy(AVCodecContext   *avctx,
+                                            const AVFrame    *frame,
+                                            CVPixelBufferRef *cv_img,
+                                            size_t           *strides,
+                                            size_t           *heights)
+{
+    int status;
+    CVPixelBufferPoolRef pix_buf_pool;
+    VTEncContext* vtctx = avctx->priv_data;
+
+    pix_buf_pool = VTCompressionSessionGetPixelBufferPool(vtctx->session);
+    if (!pix_buf_pool) {
+        /* On iOS, the VT session is invalidated when the APP switches from
+         * foreground to background and vice versa. Fetch the actual error code
+         * of the VT session to detect that case and restart the VT session
+         * accordingly. */
+        OSStatus vtstatus;
+
+        vtstatus = VTCompressionSessionPrepareToEncodeFrames(vtctx->session);
+        if (vtstatus == kVTInvalidSessionErr) {
+            CFRelease(vtctx->session);
+            vtctx->session = NULL;
+            status = vtenc_configure_encoder(avctx);
+            if (status == 0)
+                pix_buf_pool = VTCompressionSessionGetPixelBufferPool(vtctx->session);
+        }
+        if (!pix_buf_pool) {
+            av_log(avctx, AV_LOG_ERROR, "Could not get pixel buffer pool.\n");
+            return AVERROR_EXTERNAL;
+        }
+        else
+            av_log(avctx, AV_LOG_WARNING, "VT session restarted because of a "
+                   "kVTInvalidSessionErr error.\n");
+    }
+
+    status = CVPixelBufferPoolCreatePixelBuffer(NULL,
+                                                pix_buf_pool,
+                                                cv_img);
+
+
+    if (status) {
+        av_log(avctx, AV_LOG_ERROR, "Could not create pixel buffer from pool: %d.\n", status);
+        return AVERROR_EXTERNAL;
+    }
+
+    status = copy_avframe_to_pixel_buffer(avctx, frame, *cv_img, strides, heights);
+    if (status) {
+        CFRelease(*cv_img);
+        *cv_img = NULL;
+        return status;
+    }
+
+    return 0;
+}
 
 static int create_cv_pixel_buffer(AVCodecContext   *avctx,
                                   const AVFrame    *frame,
@@ -2124,10 +2178,9 @@ static int create_cv_pixel_buffer(AVCodecContext   *avctx,
     size_t strides[AV_NUM_DATA_POINTERS];
     int status;
     size_t contiguous_buf_size;
-#if TARGET_OS_IPHONE
     CVPixelBufferPoolRef pix_buf_pool;
     VTEncContext* vtctx = avctx->priv_data;
-#else
+#if !TARGET_OS_IPHONE
     CFMutableDictionaryRef pix_buf_attachments = CFDictionaryCreateMutable(
                                                    kCFAllocatorDefault,
                                                    10,
@@ -2176,82 +2229,82 @@ static int create_cv_pixel_buffer(AVCodecContext   *avctx,
     }
 
 #if TARGET_OS_IPHONE
-    pix_buf_pool = VTCompressionSessionGetPixelBufferPool(vtctx->session);
-    if (!pix_buf_pool) {
-        /* On iOS, the VT session is invalidated when the APP switches from
-         * foreground to background and vice versa. Fetch the actual error code
-         * of the VT session to detect that case and restart the VT session
-         * accordingly. */
-        OSStatus vtstatus;
+    return create_cv_pixel_buffer_with_copy(avctx, frame, cv_img, strides, heights);
+#else
+    bool must_copy = false;
 
-        vtstatus = VTCompressionSessionPrepareToEncodeFrames(vtctx->session);
-        if (vtstatus == kVTInvalidSessionErr) {
-            CFRelease(vtctx->session);
-            vtctx->session = NULL;
-            status = vtenc_configure_encoder(avctx);
-            if (status == 0)
-                pix_buf_pool = VTCompressionSessionGetPixelBufferPool(vtctx->session);
+    CFMutableDictionaryRef pixel_buffer_attrs =
+        CFDictionaryCreateMutable(kCFAllocatorDefault,
+                                  10,
+                                  &kCFCopyStringDictionaryKeyCallBacks,
+                                  &kCFTypeDictionaryValueCallBacks);
+
+    VTSessionCopyProperty(vtctx->session, kVTCompressionPropertyKey_VideoEncoderPixelBufferAttributes,
+                          kCFAllocatorDefault, pixel_buffer_attrs);
+
+    bool has_size = true;
+
+    void **ref_width, **ref_height;
+    if (!CFDictionaryGetValueIfPresent(pixel_buffer_attrs, kCVPixelBufferWidthKey, ref_width) ||
+        !CFDictionaryGetValueIfPresent(pixel_buffer_attrs, kCVPixelBufferHeightKey, ref_height))
+    {
+        /* we don't know the possible size of the picture so assume we must
+         * copy. That way we are safe whatever the picture format is */
+        must_copy = true;
+    }
+    else
+    {
+        unsigned width, height;
+        must_copy |= !CFNumberGetValue(ref_width, kCFNumberNSIntegerType, &width)
+                  || !CFNumberGetValue(ref_height, kCFNumberNSIntegerType, &height)
+                  || width != avctx->width
+                  || height != avctx->height;
+    }
+
+    if (must_copy)
+    {
+        fprintf(stderr, "Using copy mode\n");
+        create_cv_pixel_buffer_with_copy(avctx, frame, cv_img, strides, heights);
+    }
+    else
+    {
+        fprintf(stderr, "Using zero copy mode\n");
+        create_cv_pixel_buffer_with_copy(avctx, frame, cv_img, strides, heights);
+        AVFrame *enc_frame = av_frame_alloc();
+        if (!enc_frame) return AVERROR(ENOMEM);
+
+        status = av_frame_ref(enc_frame, frame);
+        if (status) {
+            av_frame_free(&enc_frame);
+            return status;
         }
-        if (!pix_buf_pool) {
-            av_log(avctx, AV_LOG_ERROR, "Could not get pixel buffer pool.\n");
+
+        status = CVPixelBufferCreateWithPlanarBytes(
+            kCFAllocatorDefault,
+            enc_frame->width,
+            enc_frame->height,
+            color,
+            NULL,
+            contiguous_buf_size,
+            plane_count,
+            (void **)enc_frame->data,
+            widths,
+            heights,
+            strides,
+            free_avframe,
+            enc_frame,
+            NULL,
+            cv_img
+        );
+
+        add_color_attr(avctx, pix_buf_attachments);
+        CVBufferSetAttachments(*cv_img, pix_buf_attachments, kCVAttachmentMode_ShouldPropagate);
+        CFRelease(pix_buf_attachments);
+
+        if (status) {
+            av_log(avctx, AV_LOG_ERROR, "Error: Could not create CVPixelBuffer: %d\n", status);
             return AVERROR_EXTERNAL;
         }
-        else
-            av_log(avctx, AV_LOG_WARNING, "VT session restarted because of a "
-                   "kVTInvalidSessionErr error.\n");
-    }
-
-    status = CVPixelBufferPoolCreatePixelBuffer(NULL,
-                                                pix_buf_pool,
-                                                cv_img);
-
-
-    if (status) {
-        av_log(avctx, AV_LOG_ERROR, "Could not create pixel buffer from pool: %d.\n", status);
-        return AVERROR_EXTERNAL;
-    }
-
-    status = copy_avframe_to_pixel_buffer(avctx, frame, *cv_img, strides, heights);
-    if (status) {
-        CFRelease(*cv_img);
-        *cv_img = NULL;
-        return status;
-    }
-#else
-    AVFrame *enc_frame = av_frame_alloc();
-    if (!enc_frame) return AVERROR(ENOMEM);
-
-    status = av_frame_ref(enc_frame, frame);
-    if (status) {
-        av_frame_free(&enc_frame);
-        return status;
-    }
-
-    status = CVPixelBufferCreateWithPlanarBytes(
-        kCFAllocatorDefault,
-        enc_frame->width,
-        enc_frame->height,
-        color,
-        NULL,
-        contiguous_buf_size,
-        plane_count,
-        (void **)enc_frame->data,
-        widths,
-        heights,
-        strides,
-        free_avframe,
-        enc_frame,
-        NULL,
-        cv_img
-    );
-
-    add_color_attr(avctx, pix_buf_attachments);
-    CVBufferSetAttachments(*cv_img, pix_buf_attachments, kCVAttachmentMode_ShouldPropagate);
-    CFRelease(pix_buf_attachments);
-
-    if (status) {
-        av_log(avctx, AV_LOG_ERROR, "Error: Could not create CVPixelBuffer: %d\n", status);
-        return AVERROR_EXTERNAL;
     }
 #endif
 
