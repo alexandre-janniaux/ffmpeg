@@ -101,6 +101,7 @@ typedef struct UDPContext {
     pthread_t circular_buffer_thread;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    pthread_cond_t cond_no_space;
     int thread_started;
 #endif
     uint8_t tmp[UDP_MAX_PKT_SIZE+4];
@@ -560,6 +561,7 @@ static void *circular_buffer_task_tx( void *_URLContext)
 
         av_fifo_generic_read(s->fifo, s->tmp, len, NULL);
 
+        pthread_cond_broadcast(&s->cond_no_space);
         pthread_mutex_unlock(&s->mutex);
         pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &old_cancelstate);
 
@@ -903,6 +905,11 @@ static int udp_open(URLContext *h, const char *uri, int flags)
             av_log(h, AV_LOG_ERROR, "pthread_cond_init failed : %s\n", strerror(ret));
             goto cond_fail;
         }
+        ret = pthread_cond_init(&s->cond_no_space, NULL);
+        if (ret != 0) {
+            av_log(h, AV_LOG_ERROR, "pthread_cond_init failed : %s\n", strerror(ret));
+            goto cond_no_space_fail;
+        }
         ret = pthread_create(&s->circular_buffer_thread, NULL, is_output?circular_buffer_task_tx:circular_buffer_task_rx, h);
         if (ret != 0) {
             av_log(h, AV_LOG_ERROR, "pthread_create failed : %s\n", strerror(ret));
@@ -915,6 +922,8 @@ static int udp_open(URLContext *h, const char *uri, int flags)
     return 0;
 #if HAVE_PTHREAD_CANCEL
  thread_fail:
+    pthread_cond_destroy(&s->cond_no_space);
+ cond_no_space_fail:
     pthread_cond_destroy(&s->cond);
  cond_fail:
     pthread_mutex_destroy(&s->mutex);
@@ -1022,10 +1031,11 @@ static int udp_write(URLContext *h, const uint8_t *buf, int size)
             return err;
         }
 
-        if(av_fifo_space(s->fifo) < size + 4) {
-            /* What about a partial packet tx ? */
-            pthread_mutex_unlock(&s->mutex);
-            return AVERROR(ENOMEM);
+        while(av_fifo_space(s->fifo) < size + 4) {
+            pthread_cond_wait(&s->cond_no_space, &s->mutex);
+            ///* What about a partial packet tx ? */
+            //pthread_mutex_unlock(&s->mutex);
+            //return AVERROR(ENOMEM);
         }
         AV_WL32(tmp, size);
         av_fifo_generic_write(s->fifo, tmp, 4, NULL); /* size of packet */
